@@ -1998,6 +1998,12 @@ class FeishuChannel(BaseChannel):
                     .register_p2_im_message_receive_v1(
                         self._on_message_sync,
                     )
+                    .register_p2_im_message_reaction_created_v1(
+                        lambda _evt: None,
+                    )
+                    .register_p2_im_message_reaction_deleted_v1(
+                        lambda _evt: None,
+                    )
                     .build()
                 )
                 self._ws_client = lark.ws.Client(
@@ -2149,6 +2155,34 @@ class FeishuChannel(BaseChannel):
 
         # Final cleanup signal
         self._stop_event.set()
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Check Feishu WebSocket and SDK client status."""
+        if not self.enabled:
+            return {
+                "channel": self.channel,
+                "status": "disabled",
+                "detail": "Feishu channel is disabled.",
+            }
+        issues = []
+        if self._client is None:
+            issues.append("Feishu SDK client not initialized")
+        ws_thread_alive = (
+            self._ws_thread is not None and self._ws_thread.is_alive()
+        )
+        if not ws_thread_alive:
+            issues.append("WebSocket thread is not running")
+        if issues:
+            return {
+                "channel": self.channel,
+                "status": "unhealthy",
+                "detail": "; ".join(issues),
+            }
+        return {
+            "channel": self.channel,
+            "status": "healthy",
+            "detail": "Feishu SDK client and WebSocket are active.",
+        }
 
     async def start(self) -> None:
         if not self.enabled:

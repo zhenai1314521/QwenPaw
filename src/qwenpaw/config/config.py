@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-import os
+from __future__ import annotations
+
 import json
 import re
 from pathlib import Path
@@ -31,8 +32,90 @@ from ..constant import (
     LLM_RATE_LIMIT_PAUSE,
     WORKING_DIR,
 )
-from ..providers.models import ModelSlotConfig
-from ..agents.acp.core import ACPConfig
+
+
+# ============================================================================
+# Core config models (moved here to avoid circular imports)
+# ============================================================================
+
+
+class ModelSlotConfig(BaseModel):
+    """Model slot configuration for LLM routing."""
+
+    provider_id: str = Field(default="")
+    model: str = Field(default="")
+
+
+class ActiveModelsInfo(BaseModel):
+    """Active models information for provider manager."""
+
+    active_llm: ModelSlotConfig | None
+
+
+class ACPAgentConfig(BaseModel):
+    """Configuration for one ACP agent."""
+
+    enabled: bool = False
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: Dict[str, str] = Field(default_factory=dict)
+    trusted: bool = True
+    tool_parse_mode: str = "call_title"
+    stdio_buffer_limit_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        gt=0,
+    )
+
+
+def _get_default_acp_agents() -> Dict[str, ACPAgentConfig]:
+    """Get default ACP agents configuration."""
+    return {
+        "opencode": ACPAgentConfig(
+            enabled=True,
+            command="opencode",
+            args=["acp"],
+            trusted=True,
+            tool_parse_mode="update_detail",
+        ),
+        "qwen_code": ACPAgentConfig(
+            enabled=True,
+            command="qwen",
+            args=["--acp"],
+            trusted=True,
+            tool_parse_mode="call_detail",
+        ),
+        "claude_code": ACPAgentConfig(
+            enabled=True,
+            command="npx",
+            args=["-y", "@zed-industries/claude-agent-acp"],
+            trusted=True,
+            tool_parse_mode="update_detail",
+        ),
+        "codex": ACPAgentConfig(
+            enabled=True,
+            command="npx",
+            args=["-y", "@zed-industries/codex-acp"],
+            trusted=True,
+            tool_parse_mode="call_detail",
+        ),
+    }
+
+
+class ACPConfig(BaseModel):
+    """ACP (Agent Communication Protocol) configuration."""
+
+    agents: Dict[str, ACPAgentConfig] = Field(
+        default_factory=_get_default_acp_agents,
+    )
+
+    @model_validator(mode="after")
+    def _merge_default_agents(self):
+        """Merge default agents with user-configured agents."""
+        for name, agent_cfg in _get_default_acp_agents().items():
+            if name not in self.agents:
+                self.agents[name] = agent_cfg
+        return self
+
 
 # Agent ID validation: alphanumeric, hyphens, underscores.
 _AGENT_ID_PATTERN = re.compile(
@@ -139,11 +222,13 @@ class DingTalkConfig(BaseChannelConfig):
     client_id: str = ""
     client_secret: str = ""
     message_type: str = "markdown"
+    cron_message_type: str = "markdown"
     card_template_id: str = ""
     card_template_key: str = "content"
     robot_code: str = ""
     media_dir: Optional[str] = None
     card_auto_layout: bool = False
+    at_sender_on_reply: bool = False
 
 
 class FeishuConfig(BaseChannelConfig):
@@ -273,6 +358,34 @@ class VoiceChannelConfig(BaseChannelConfig):
     welcome_greeting: str = "Hi! This is QwenPaw. How can I help you?"
 
 
+class SIPChannelConfig(BaseChannelConfig):
+    """SIP voice channel: dual-track (pyVoIP dev / LiveKit production)."""
+
+    sip_mode: str = "dev"
+    sip_host: str = "0.0.0.0"
+    sip_port: int = 5061
+    sip_username: str = ""
+    sip_password: str = ""
+    sip_server: str = ""
+    sip_transport: str = "UDP"
+    rtp_port_low: int = 10000
+    rtp_port_high: int = 20000
+    dashscope_api_key: str = ""
+    tts_provider: str = "aliyun"
+    tts_voice: str = ""
+    stt_provider: str = "aliyun"
+    language: str = "zh-CN"
+    welcome_greeting: str = "你好，我是QwenPaw"
+    call_timeout: float = 120.0
+    livekit_url: str = ""
+    livekit_api_key: str = ""
+    livekit_api_secret: str = ""
+    livekit_sip_trunk_id: str = ""
+    livekit_room_name: str = "sip-inbound"
+    livekit_output_sample_rate: int = 24000
+    max_concurrent_calls: int = 5
+
+
 class XiaoYiConfig(BaseChannelConfig):
     """XiaoYi channel: Huawei A2A protocol via WebSocket."""
 
@@ -286,17 +399,28 @@ class XiaoYiConfig(BaseChannelConfig):
 class WeixinConfig(BaseChannelConfig):
     """WeChat (iLink Bot) personal account channel config.
 
-    bot_token:      Bearer token obtained after QR code login.
-    bot_token_file: Path to persist/load the bot_token
-                    (default ~/.qwenpaw/weixin_bot_token).
-    base_url:       iLink API base URL (leave empty to use default).
-    media_dir:      Local directory for downloaded media files.
+    bot_token:              Bearer token obtained after QR code login.
+    bot_token_file:         Path to persist/load the bot_token
+                            (default ~/.qwenpaw/weixin_bot_token).
+    base_url:               iLink API base URL (leave empty to use default).
+    media_dir:              Local directory for downloaded media files.
+    message_merge_enabled:  When True, merge multiple outgoing text messages
+                            within a single request to reduce message count
+                            (mitigates the 10-message context_token limit).
+    message_merge_delay_ms: Controls merge behaviour when merging is enabled.
+                            0  → merge ALL text messages and send once at the
+                                 end of the request (maximum savings).
+                            >0 → buffer messages for this many milliseconds;
+                                 if no new message arrives within the window
+                                 the buffer is flushed (adjacent-merge mode).
     """
 
     bot_token: str = ""
     bot_token_file: str = ""
     base_url: str = ""
     media_dir: Optional[str] = None
+    message_merge_enabled: bool = False
+    message_merge_delay_ms: Optional[int] = 0
 
 
 class ChannelConfig(BaseModel):
@@ -315,6 +439,7 @@ class ChannelConfig(BaseModel):
     console: ConsoleConfig = ConsoleConfig()
     matrix: MatrixConfig = MatrixConfig()
     voice: VoiceChannelConfig = VoiceChannelConfig()
+    sip: SIPChannelConfig = SIPChannelConfig()
     wecom: WecomConfig = WecomConfig()
     xiaoyi: XiaoYiConfig = XiaoYiConfig()
     weixin: WeixinConfig = WeixinConfig()
@@ -351,7 +476,37 @@ class AgentsDefaultsConfig(BaseModel):
     heartbeat: Optional[HeartbeatConfig] = None
 
 
-class EmbeddingConfig(BaseModel):
+class AutoMemorySearchConfig(BaseModel):
+    """Auto memory search configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to auto search memory on every turn",
+    )
+
+    max_results: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Maximum number of results to return when auto memory"
+            " search is enabled"
+        ),
+    )
+
+    min_score: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum relevance score for results when auto memory"
+            " search is enabled"
+        ),
+    )
+
+
+class EmbeddingModelConfig(BaseModel):
     """Embedding model configuration."""
 
     model_config = ConfigDict(extra="ignore")
@@ -386,119 +541,23 @@ class EmbeddingConfig(BaseModel):
     )
 
 
-class ContextCompactConfig(BaseModel):
-    """Context compaction and token-counting configuration."""
+class ReMeLightMemoryConfig(BaseModel):
+    """ReMeLight memory manager configuration."""
 
     model_config = ConfigDict(extra="ignore")
 
-    token_count_model: str = Field(
-        default="default",
-        description="Model to use for token counting",
-    )
-
-    token_count_use_mirror: bool = Field(
-        default=False,
-        description="Whether to use HuggingFace mirror for token counting",
-    )
-
-    token_count_estimate_divisor: float = Field(
-        default=4,
-        ge=2,
-        le=5,
-        description=(
-            "Divisor for byte-based token estimation (byte_len / divisor)"
-        ),
-    )
-
-    context_compact_enabled: bool = Field(
-        default=True,
-        description="Whether to enable automatic context compaction",
-    )
-
-    memory_compact_ratio: float = Field(
-        default=0.75,
-        ge=0.3,
-        le=0.9,
-        description=(
-            "Compaction trigger threshold ratio: compaction is triggered when "
-            "the context length reaches this fraction of max_input_length"
-        ),
-    )
-
-    memory_reserve_ratio: float = Field(
-        default=0.1,
-        ge=0.05,
-        le=0.3,
-        description=(
-            "Context reserve threshold ratio: the most recent fraction of the "
-            "context is preserved after compaction to maintain continuity"
-        ),
-    )
-
-    compact_with_thinking_block: bool = Field(
-        default=True,
-        description="Whether to include thinking blocks when compacting",
-    )
-
-
-class ToolResultCompactConfig(BaseModel):
-    """Tool result compaction thresholds and retention configuration."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = Field(
-        default=True,
-        description="Whether to enable tool result compaction",
-    )
-
-    recent_n: int = Field(
-        default=2,
-        ge=1,
-        le=10,
-        description="Number of recent messages to use recent_max_bytes for",
-    )
-
-    old_max_bytes: int = Field(
-        default=3000,
-        ge=100,
-        description=(
-            "Byte threshold for old messages in tool result compaction"
-        ),
-    )
-
-    recent_max_bytes: int = Field(
-        default=50000,
-        ge=1000,
-        description=(
-            "Byte threshold for recent messages in tool result compaction"
-        ),
-    )
-
-    retention_days: int = Field(
-        default=5,
-        ge=1,
-        le=10,
-        description="Number of days to retain tool result files",
-    )
-
-
-class MemorySummaryConfig(BaseModel):
-    """Memory summarization and search configuration."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    memory_summary_enabled: bool = Field(
+    summarize_when_compact: bool = Field(
         default=True,
         description="Whether to enable memory summarization during compaction",
     )
 
-    memory_prompt_enabled: bool = Field(
-        default=True,
-        description=(
-            "Whether to include the memory guidance section in the system"
-            " prompt (the <!-- memory:start/end --> block in AGENTS.md)."
-            " Set to False to omit it and save tokens."
-        ),
+    auto_memory_interval: int | None = Field(
+        default=None,
+        description="Auto memory every N user queries. None disables "
+        "periodic auto memory, 1 means auto memory after every user "
+        "query, 2 means every 2 queries, etc. WARNING: Setting too "
+        "small (e.g., 1-3) may cause high token usage and heavy "
+        "background task burden. Recommended: 5 or 10.",
     )
 
     dream_cron: str = Field(
@@ -507,37 +566,12 @@ class MemorySummaryConfig(BaseModel):
         "(empty to disable)",
     )
 
-    force_memory_search: bool = Field(
-        default=False,
-        description="Whether to force memory search on every turn",
+    auto_memory_search_config: AutoMemorySearchConfig = Field(
+        default_factory=AutoMemorySearchConfig,
     )
 
-    force_max_results: int = Field(
-        default=1,
-        ge=1,
-        description=(
-            "Maximum number of results to return when force memory"
-            " search is enabled"
-        ),
-    )
-
-    force_min_score: float = Field(
-        default=0.3,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Minimum relevance score for results when force memory"
-            " search is enabled"
-        ),
-    )
-
-    force_memory_search_timeout: float = Field(
-        default=10.0,
-        gt=0.0,
-        description=(
-            "Timeout in seconds for force memory search. Increase this value"
-            " when using remote embedding APIs that may have higher latency."
-        ),
+    embedding_model_config: EmbeddingModelConfig = Field(
+        default_factory=EmbeddingModelConfig,
     )
 
     rebuild_memory_index_on_start: bool = Field(
@@ -556,6 +590,133 @@ class MemorySummaryConfig(BaseModel):
             "Set to True to include subdirectories like memory/subdirectory/* "
             "in vector search indexing."
         ),
+    )
+
+
+class ContextCompactConfig(BaseModel):
+    """Context compaction configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether to enable automatic context compaction",
+    )
+
+    compact_threshold_ratio: float = Field(
+        default=0.8,
+        ge=0.1,
+        le=0.9,
+        description=(
+            "Compaction trigger threshold ratio: compaction is triggered when "
+            "the context length reaches this fraction of max_input_length"
+        ),
+    )
+
+    reserve_threshold_ratio: float = Field(
+        default=0.1,
+        ge=0,
+        le=0.3,
+        description=(
+            "Context reserve threshold ratio: the most recent fraction of the "
+            "context is preserved after compaction to maintain continuity"
+        ),
+    )
+
+    compact_with_thinking_block: bool = Field(
+        default=True,
+        description="Whether to include thinking blocks when compacting",
+    )
+
+
+class ToolResultPruningConfig(BaseModel):
+    """Tool result pruning configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether to enable tool result pruning",
+    )
+
+    pruning_recent_n: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Number of recent messages to use recent_max_bytes for",
+    )
+
+    pruning_old_msg_max_bytes: int = Field(
+        default=3000,
+        ge=100,
+        description=("Byte threshold for old messages in tool result pruning"),
+    )
+
+    pruning_recent_msg_max_bytes: int = Field(
+        default=50000,
+        ge=1000,
+        description=(
+            "Byte threshold for recent messages in tool result pruning"
+        ),
+    )
+
+    offload_retention_days: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Number of days to retain tool result files",
+    )
+
+    tool_results_cache: str = Field(
+        default="tool_results",
+        description="Directory name for tool result cache files "
+        "relative to working_dir",
+    )
+
+    exempt_file_extensions: List[str] = Field(
+        default_factory=lambda: [".md"],
+        description=(
+            "File extensions exempt from tool result pruning. "
+            "Tool results for read_file operations on these file types "
+            "will use recent_max_bytes instead of old_max_bytes."
+        ),
+    )
+
+    exempt_tool_names: List[str] = Field(
+        default_factory=lambda: ["chat_with_agent"],
+        description=(
+            "Tool names exempt from tool result pruning. "
+            "Tool results from these tools will use recent_max_bytes "
+            "instead of old_max_bytes."
+        ),
+    )
+
+
+class LightContextConfig(BaseModel):
+    """Light context manager configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    dialog_path: str = Field(
+        default="dialog",
+        description="Path for dialog persistence to jsonl files "
+        "relative to working_dir.",
+    )
+
+    token_count_estimate_divisor: float = Field(
+        default=4,
+        ge=2,
+        le=5,
+        description=(
+            "Divisor for byte-based token estimation (byte_len / divisor)"
+        ),
+    )
+
+    context_compact_config: ContextCompactConfig = Field(
+        default_factory=ContextCompactConfig,
+    )
+    tool_result_pruning_config: ToolResultPruningConfig = Field(
+        default_factory=ToolResultPruningConfig,
     )
 
 
@@ -656,6 +817,16 @@ class AgentsRunningConfig(BaseModel):
         ),
     )
 
+    shell_command_timeout: float = Field(
+        default=60.0,
+        ge=1.0,
+        description=(
+            "Default timeout in seconds for execute_shell_command. "
+            "The LLM may still override this per-call via the timeout "
+            "parameter."
+        ),
+    )
+
     @model_validator(mode="after")
     def validate_llm_retry_backoff(self) -> "AgentsRunningConfig":
         """Validate LLM retry backoff relationships."""
@@ -683,47 +854,31 @@ class AgentsRunningConfig(BaseModel):
         description="Maximum length for /history command output",
     )
 
-    context_compact: ContextCompactConfig = Field(
-        default_factory=ContextCompactConfig,
-        description="Context compaction configuration",
+    context_manager_backend: str = Field(default="light")
+
+    light_context_config: LightContextConfig = Field(
+        default_factory=LightContextConfig,
     )
 
-    tool_result_compact: ToolResultCompactConfig = Field(
-        default_factory=ToolResultCompactConfig,
-        description="Tool result compaction configuration",
+    memory_manager_backend: str = Field(default="remelight")
+
+    reme_light_memory_config: ReMeLightMemoryConfig = Field(
+        default_factory=ReMeLightMemoryConfig,
     )
 
-    memory_summary: MemorySummaryConfig = Field(
-        default_factory=MemorySummaryConfig,
-        description="Memory summarization and search configuration",
+    daily_memory_dir: str = Field(
+        default="memory",
+        description="Dir name to daily summary file",
     )
 
-    embedding_config: EmbeddingConfig = Field(
-        default_factory=EmbeddingConfig,
-        description="Embedding model configuration",
-    )
-
-    memory_manager_backend: Literal["remelight"] = Field(
-        default="remelight",
+    approval_level: Optional[str] = Field(
+        default=None,
         description=(
-            "Memory manager backend type. "
-            "Currently only 'remelight' is supported."
+            "Tool execution security level (proxied from agent profile): "
+            "STRICT, SMART, AUTO, or OFF.  When set via running-config API, "
+            "the value is written back to the agent profile."
         ),
     )
-
-    @property
-    def memory_compact_reserve(self) -> int:
-        """Memory compact reserve size (tokens)."""
-        return int(
-            self.max_input_length * self.context_compact.memory_reserve_ratio,
-        )
-
-    @property
-    def memory_compact_threshold(self) -> int:
-        """Memory compact threshold size (tokens)."""
-        return int(
-            self.max_input_length * self.context_compact.memory_compact_ratio,
-        )
 
 
 class AgentsLLMRoutingConfig(BaseModel):
@@ -768,6 +923,15 @@ class AgentProfileRef(BaseModel):
     enabled: bool = Field(
         default=True,
         description="Whether agent is enabled (controls instance loading)",
+    )
+
+
+class PlanConfig(BaseModel):
+    """Plan mode configuration (stored in agent.json)."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether plan mode is enabled for this agent",
     )
 
 
@@ -822,6 +986,16 @@ class AgentProfileConfig(BaseModel):
         default="zh",
         description="Language setting for this agent",
     )
+    approval_level: str = Field(
+        default="AUTO",
+        description=(
+            "Tool execution security level: "
+            "STRICT (all tools need approval), "
+            "SMART (low-risk auto-allowed), "
+            "AUTO (only guarded tools), "
+            "OFF (guard disabled)"
+        ),
+    )
     system_prompt_files: List[str] = Field(
         default_factory=lambda: ["AGENTS.md", "SOUL.md", "PROFILE.md"],
         description="System prompt markdown files",
@@ -833,6 +1007,14 @@ class AgentProfileConfig(BaseModel):
     security: Optional["SecurityConfig"] = Field(
         default=None,
         description="Security configuration for this agent",
+    )
+    acp: Optional[ACPConfig] = Field(
+        default=None,
+        description="ACP configuration for this agent",
+    )
+    plan: PlanConfig = Field(
+        default_factory=PlanConfig,
+        description="Plan mode configuration for this agent",
     )
 
 
@@ -1007,11 +1189,10 @@ class MCPConfig(BaseModel):
         default_factory=lambda: {
             "tavily_search": MCPClientConfig(
                 name="tavily_mcp",
-                # Auto-enable if TAVILY_API_KEY exists in environment
-                enabled=bool(os.getenv("TAVILY_API_KEY")),
+                enabled=False,
                 command="npx",
                 args=["-y", "tavily-mcp@latest"],
-                env={"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", "")},
+                env={"TAVILY_API_KEY": ""},
             ),
         },
     )
@@ -1174,12 +1355,22 @@ class ToolsConfig(BaseModel):
 
     @model_validator(mode="after")
     def _merge_default_tools(self):
-        """Ensure new code-defined tools are present in saved configs."""
-        for name, tc in _default_builtin_tools().items():
+        """Ensure new code-defined tools are present in saved configs.
+
+        Also normalises legacy entries whose ``icon`` is ``None`` so that
+        downstream serialisation (e.g. ``ToolInfo``) never receives a null
+        icon value.
+        """
+        defaults = _default_builtin_tools()
+        for name, tc in defaults.items():
             if name not in self.builtin_tools:
                 self.builtin_tools[name] = tc
             elif self.builtin_tools[name].icon is None:
                 self.builtin_tools[name].icon = tc.icon
+        # Normalise legacy/stale entries not in the current defaults
+        for name, tc in self.builtin_tools.items():
+            if name not in defaults and tc.icon is None:
+                tc.icon = ""
         return self
 
 
@@ -1246,6 +1437,19 @@ class ToolGuardRuleConfig(BaseModel):
     remediation: str = ""
 
 
+def _default_shell_evasion_checks() -> Dict[str, bool]:
+    """Return default shell-evasion checks (all disabled at startup)."""
+    return {
+        "command_substitution": False,
+        "obfuscated_flags": False,
+        "backslash_escaped_whitespace": False,
+        "backslash_escaped_operators": False,
+        "newlines": False,
+        "comment_quote_desync": False,
+        "quoted_newline": False,
+    }
+
+
 class ToolGuardConfig(BaseModel):
     """Tool guard settings under ``security.tool_guard``.
 
@@ -1258,6 +1462,9 @@ class ToolGuardConfig(BaseModel):
     denied_tools: List[str] = Field(default_factory=list)
     custom_rules: List[ToolGuardRuleConfig] = Field(default_factory=list)
     disabled_rules: List[str] = Field(default_factory=list)
+    shell_evasion_checks: Dict[str, bool] = Field(
+        default_factory=_default_shell_evasion_checks,
+    )
 
 
 class FileGuardConfig(BaseModel):
@@ -1315,6 +1522,15 @@ class SecurityConfig(BaseModel):
     skill_scanner: SkillScannerConfig = Field(
         default_factory=SkillScannerConfig,
     )
+    allow_no_auth_hosts: List[str] = Field(
+        default_factory=lambda: ["127.0.0.1", "::1"],
+        description=(
+            "List of client IP addresses that can access API endpoints "
+            "without authentication. By default, localhost addresses "
+            "(127.0.0.1 for IPv4, ::1 for IPv6) are allowed. "
+            "WARNING: Only add trusted IP addresses to this list."
+        ),
+    )
 
 
 class Config(BaseModel):
@@ -1353,6 +1569,7 @@ ChannelConfigUnion = Union[
     ConsoleConfig,
     MatrixConfig,
     VoiceChannelConfig,
+    SIPChannelConfig,
     WecomConfig,
     XiaoYiConfig,
     WeixinConfig,
@@ -1413,11 +1630,15 @@ def build_fallback_agent_profile_config(
             and config.agents.system_prompt_files
             else ["AGENTS.md", "SOUL.md", "PROFILE.md"]
         ),
+        acp=(config.acp if hasattr(config, "acp") and config.acp else None),
     )
 
 
 def load_agent_config(agent_id: str) -> AgentProfileConfig:
-    """Load agent's complete configuration from workspace/agent.json.
+    """Load agent's complete configuration from workspace/agent.json with
+    mtime-based caching.
+
+    Uses file modification time to avoid unnecessary disk reads.
 
     Args:
         agent_id: Agent ID to load
@@ -1428,7 +1649,11 @@ def load_agent_config(agent_id: str) -> AgentProfileConfig:
     Raises:
         ValueError: If agent ID not found in root config
     """
-    from .utils import load_config
+    from .utils import (
+        load_config,
+        _agent_config_cache,
+        _agent_config_lock,
+    )
 
     config = load_config()
 
@@ -1448,27 +1673,48 @@ def load_agent_config(agent_id: str) -> AgentProfileConfig:
         save_agent_config(agent_id, fallback_config)
         return fallback_config
 
-    with open(agent_config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Normalize legacy ~/.copaw-bound paths to current WORKING_DIR.
-    # This keeps QWENPAW_WORKING_DIR effective even if existing agent.json
-    # contains older hard-coded paths like "~/.copaw/media".
+    # Check mtime to see if we can use cached config
     try:
-        from .utils import _normalize_working_dir_bound_paths
+        current_mtime = agent_config_path.stat().st_mtime
+    except OSError:
+        fallback_config = build_fallback_agent_profile_config(agent_id, config)
+        save_agent_config(agent_id, fallback_config)
+        return fallback_config
 
-        data = _normalize_working_dir_bound_paths(data)
-    except Exception:
-        pass
+    with _agent_config_lock:
+        # Return cached config if mtime hasn't changed
+        if agent_id in _agent_config_cache:
+            cached_config, cached_mtime = _agent_config_cache[agent_id]
+            if cached_mtime == current_mtime:
+                return cached_config
 
-    return AgentProfileConfig(**data)
+        # Need to reload config from disk
+        with open(agent_config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Normalize legacy ~/.copaw-bound paths to current WORKING_DIR.
+        # This keeps QWENPAW_WORKING_DIR effective even if existing agent.json
+        # contains older hard-coded paths like "~/.copaw/media".
+        try:
+            from .utils import _normalize_working_dir_bound_paths
+
+            data = _normalize_working_dir_bound_paths(data)
+        except Exception:
+            pass
+
+        agent_config = AgentProfileConfig(**data)
+
+        # Cache the config with its mtime
+        _agent_config_cache[agent_id] = (agent_config, current_mtime)
+
+        return agent_config
 
 
 def save_agent_config(
     agent_id: str,
     agent_config: AgentProfileConfig,
 ) -> None:
-    """Save agent configuration to workspace/agent.json.
+    """Save agent configuration to workspace/agent.json and invalidate cache.
 
     Args:
         agent_id: Agent ID
@@ -1477,7 +1723,11 @@ def save_agent_config(
     Raises:
         ValueError: If agent ID not found in root config
     """
-    from .utils import load_config
+    from .utils import (
+        load_config,
+        _agent_config_cache,
+        _agent_config_lock,
+    )
 
     config = load_config()
 
@@ -1500,6 +1750,11 @@ def save_agent_config(
             ensure_ascii=False,
             indent=2,
         )
+
+    # Invalidate cache after saving
+    with _agent_config_lock:
+        if agent_id in _agent_config_cache:
+            del _agent_config_cache[agent_id]
 
 
 def migrate_legacy_config_to_multi_agent() -> bool:
